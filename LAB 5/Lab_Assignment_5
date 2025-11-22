@@ -1,0 +1,94 @@
+import yfinance as yf
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from hmmlearn.hmm import GaussianHMM
+import seaborn as sns
+import os
+
+# -----------------------------------------
+# 1. DATA COLLECTION
+# -----------------------------------------
+symbol = "AAPL"
+start_date = "2013-01-01"
+end_date = "2024-01-01"
+
+df = yf.download(symbol, start=start_date, end=end_date)
+
+# yfinance changed default — use "Close"
+df["Return"] = np.log(df["Close"] / df["Close"].shift(1))
+df = df.dropna()
+
+returns = df["Return"].values.reshape(-1, 1)
+
+# Directory for saving plots
+SAVE_DIR = "."
+print("Plots will be saved to:", os.path.abspath(SAVE_DIR))
+
+# -----------------------------------------
+# 2. FIT GAUSSIAN HMM
+# -----------------------------------------
+model = GaussianHMM(n_components=2, covariance_type="full", n_iter=500)
+model.fit(returns)
+hidden_states = model.predict(returns)
+
+print("\nMeans:", model.means_)
+print("Covariances:", model.covars_)
+print("Transition Matrix:", model.transmat_)
+
+# -----------------------------------------
+# 3. VISUALIZATION (Show + Save)
+# -----------------------------------------
+
+# ---- Price Plot ----
+plt.figure(figsize=(12,4))
+plt.plot(df.index, df["Close"])
+plt.title("AAPL Adjusted Close Price")
+plt.xlabel("Year")
+plt.ylabel("Price")
+plt.tight_layout()
+plt.savefig(os.path.join(SAVE_DIR, "price_plot.png"), dpi=300)
+plt.show()
+
+# ---- Return Plot ----
+plt.figure(figsize=(12,4))
+plt.plot(df.index, df["Return"])
+plt.title("AAPL Daily Returns")
+plt.xlabel("Year")
+plt.ylabel("Return")
+plt.tight_layout()
+plt.savefig(os.path.join(SAVE_DIR, "returns_plot.png"), dpi=300)
+plt.show()
+
+# ---- Hidden Regimes ----
+plt.figure(figsize=(12,4))
+for state in range(2):
+    mask = hidden_states == state
+    plt.plot(df.index[mask], df["Return"][mask], ".", label=f"State {state}")
+plt.legend()
+plt.title("Hidden Market Regimes (Gaussian HMM)")
+plt.xlabel("Year")
+plt.ylabel("Return")
+plt.tight_layout()
+plt.savefig(os.path.join(SAVE_DIR, "regime_plot.png"), dpi=300)
+plt.show()
+
+# ---- Histograms ----
+plt.figure(figsize=(10,5))
+for state in range(2):
+    sns.histplot(df["Return"][hidden_states == state], kde=True, bins=40, label=f"State {state}")
+plt.legend()
+plt.title("Return Distribution for Hidden States")
+plt.tight_layout()
+plt.savefig(os.path.join(SAVE_DIR, "state_histogram.png"), dpi=300)
+plt.show()
+
+# ---- Transition Matrix Heatmap ----
+plt.figure(figsize=(4,3))
+sns.heatmap(model.transmat_, annot=True, cmap="Blues")
+plt.title("HMM Transition Matrix")
+plt.tight_layout()
+plt.savefig(os.path.join(SAVE_DIR, "transition_matrix.png"), dpi=300)
+plt.show()
+
+print("\nAll plots saved AND displayed successfully.")
