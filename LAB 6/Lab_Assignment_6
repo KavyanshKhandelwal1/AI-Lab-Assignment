@@ -1,0 +1,212 @@
+import numpy as np
+from math import exp, factorial
+import matplotlib.pyplot as plt
+
+# --------------------------
+# PARAMETERS (change if needed)
+# --------------------------
+MAX_BIKES = 20             # maximum bikes per location
+MAX_MOVE = 5               # max bikes moved overnight (per night)
+RENTAL_REWARD = 10         # INR per rented bike
+MOVE_COST = 2              # INR per additional moved bike
+PARKING_COST_THRESHOLD = 10
+PARKING_COST = 4           # extra cost if > threshold bikes overnight at a location
+DISCOUNT = 0.9
+
+# Poisson means: requests and returns per location (loc1, loc2)
+REQ_MEAN = [3.0, 4.0]
+RET_MEAN = [3.0, 2.0]
+
+# truncate Poisson tails at POISSON_UPPER-1 (0..POISSON_UPPER-1)
+POISSON_UPPER = 11
+
+# --------------------------
+# HELPERS AND PRECOMPUTE
+# --------------------------
+def poisson_pmf(n, lam):
+    return exp(-lam) * (lam ** n) / factorial(n)
+
+# build poisson pmfs (0..POISSON_UPPER-1) and add leftover tail to last bucket
+poisson_cache = {}
+for lam in set(REQ_MEAN + RET_MEAN):
+    pmf = [poisson_pmf(i, lam) for i in range(POISSON_UPPER)]
+    tail = 1.0 - sum(pmf)
+    pmf[-1] += tail
+    poisson_cache[lam] = pmf
+
+req_pmf = [poisson_cache[REQ_MEAN[0]], poisson_cache[REQ_MEAN[1]]]
+ret_pmf = [poisson_cache[RET_MEAN[0]], poisson_cache[RET_MEAN[1]]]
+
+# Precompute per-location transitions:
+# prob_next[loc][start, next] = P(next_end_of_day = next | start)
+# exp_rent[loc][start, next] = expected rental INR contribution for that (start->next)
+prob_next = [np.zeros((MAX_BIKES + 1, MAX_BIKES + 1)) for _ in range(2)]
+exp_rent  = [np.zeros((MAX_BIKES + 1, MAX_BIKES + 1)) for _ in range(2)]
+
+for loc in (0, 1):
+    for start in range(MAX_BIKES + 1):
+        for r in range(POISSON_UPPER):
+            p_r = req_pmf[loc][r]
+            real_r = min(start, r)  # actual rentals limited by available bikes
+            bikes_after_r = start - real_r
+            rental_gain = RENTAL_REWARD * real_r
+            for ret in range(POISSON_UPPER):
+                p_ret = ret_pmf[loc][ret]
+                next_bikes = min(bikes_after_r + ret, MAX_BIKES)
+                prob_next[loc][start, next_bikes] += p_r * p_ret
+                exp_rent[loc][start, next_bikes] += p_r * p_ret * rental_gain
+
+# Actions: net bikes moved from location 1 -> location 2 (positive: 1 -> 2)
+ACTIONS = np.arange(-MAX_MOVE, MAX_MOVE + 1)
+
+def parking_penalty(start1, start2):
+    cost = 0
+    if start1 > PARKING_COST_THRESHOLD:
+        cost += PARKING_COST
+    if start2 > PARKING_COST_THRESHOLD:
+        cost += PARKING_COST
+    return cost
+
+def feasible_actions(state1, state2):
+    """Return list of feasible actions given end-of-day counts (can't move more bikes than you have)."""
+    feas = []
+    for a in ACTIONS:
+        if a > 0 and a > state1:
+            continue
+        if a < 0 and (-a) > state2:
+            continue
+        feas.append(a)
+    return feas
+
+# Precompute transitions for each (state1,state2,action) to speed up evaluation.
+# Store for each triple:
+#   - 'trans': list of (next1, next2, prob) triplets (only nonzero probs)
+#   - 'exp_rent': scalar expected rental INR (unconditional)
+#   - 'immediate_cost': scalar cost of moving+parking for that action
+from collections import defaultdict
+transitions = {}
+
+for s1 in range(MAX_BIKES + 1):
+    for s2 in range(MAX_BIKES + 1):
+        for a in ACTIONS:
+            # infeasible action skip
+            if a > 0 and a > s1:
+                continue
+            if a < 0 and (-a) > s2:
+                continue
+            start1 = min(max(s1 - a, 0), MAX_BIKES)  # bikes available start-of-day at loc1
+            start2 = min(max(s2 + a, 0), MAX_BIKES)  # loc2
+
+            # move cost: first bike when moving 1->2 is free
+            if a > 0:
+                move_cost = MOVE_COST * max(0, a - 1)
+            else:
+                move_cost = MOVE_COST * abs(a)
+            park_cost = parking_penalty(start1, start2)
+            immediate_cost = move_cost + park_cost
+
+            # unconditional expected rent contribution for start1,start2
+            exp_rent_scalar = exp_rent[0][start1].sum() + exp_rent[1][start2].sum()
+
+            # build transition list of next states
+            trans_list = []
+            for n1 in range(MAX_BIKES + 1):
+                p1 = prob_next[0][start1, n1]
+                if p1 == 0:
+                    continue
+                for n2 in range(MAX_BIKES + 1):
+                    p2 = prob_next[1][start2, n2]
+                    if p2 == 0:
+                        continue
+                    prob = p1 * p2
+                    trans_list.append((n1, n2, prob))
+
+            transitions[(s1, s2, a)] = {
+                'trans': trans_list,
+                'exp_rent': exp_rent_scalar,
+                'immediate_cost': immediate_cost
+            }
+
+# --------------------------
+# POLICY ITERATION
+# --------------------------
+policy = np.zeros((MAX_BIKES + 1, MAX_BIKES + 1), dtype=int)  # initial policy: do nothing
+V = np.zeros((MAX_BIKES + 1, MAX_BIKES + 1))                  # initial value function
+
+def expected_return_precomp(i, j, a, V_array):
+    info = transitions[(i, j, a)]
+    exp_rent_scalar = info['exp_rent']
+    immediate_cost = info['immediate_cost']
+    # immediate expected reward is exp_rent_scalar - immediate_cost
+    expected = exp_rent_scalar - immediate_cost
+    # add discounted expected value of next states
+    s = 0.0
+    for (n1, n2, prob) in info['trans']:
+        s += prob * V_array[n1, n2]
+    expected += DISCOUNT * s
+    return expected
+
+def policy_iteration(max_iters=50, theta=1e-3):
+    global policy, V
+    it = 0
+    while True:
+        it += 1
+        # Policy evaluation (iterative until small delta)
+        while True:
+            delta = 0.0
+            V_new = np.copy(V)
+            for i in range(MAX_BIKES + 1):
+                for j in range(MAX_BIKES + 1):
+                    a = policy[i, j]
+                    if (i, j, a) not in transitions:
+                        feas = feasible_actions(i, j)
+                        a = feas[0]
+                    V_new[i, j] = expected_return_precomp(i, j, a, V)
+                    delta = max(delta, abs(V_new[i, j] - V[i, j]))
+            V = V_new
+            if delta < theta:
+                break
+
+        # Policy improvement
+        policy_stable = True
+        for i in range(MAX_BIKES + 1):
+            for j in range(MAX_BIKES + 1):
+                old_action = policy[i, j]
+                best_action = old_action
+                best_value = -1e12
+                for a in feasible_actions(i, j):
+                    if (i, j, a) not in transitions:
+                        continue
+                    val = expected_return_precomp(i, j, a, V)
+                    if val > best_value:
+                        best_value = val
+                        best_action = a
+                policy[i, j] = best_action
+                if best_action != old_action:
+                    policy_stable = False
+
+        print(f"Policy iteration {it}, policy_stable={policy_stable}")
+        if policy_stable or it >= max_iters:
+            break
+
+    return policy, V
+
+# Run policy iteration
+if _name_ == "_main_":
+    opt_policy, opt_V = policy_iteration(max_iters=50, theta=1e-3)
+
+    # Print results summary:
+    print("\nOptimal policy (action = bikes moved from loc1 -> loc2):")
+    print(opt_policy)
+    print("\nSample of optimal value function (V[0..5,0..5]):")
+    print(opt_V[:6, :6])
+
+    # Plot policy heatmap
+    plt.figure(figsize=(9, 6))
+    plt.imshow(opt_policy.T, origin='lower', extent=[0, MAX_BIKES, 0, MAX_BIKES])
+    plt.colorbar(label='Action (move from loc1 -> loc2)')
+    plt.xlabel('Bikes at location 1 (end of day)')
+    plt.ylabel('Bikes at location 2 (end of day)')
+    plt.title('Optimal policy: action = bikes moved from loc1 to loc2')
+    plt.tight_layout()
+    plt.show()
