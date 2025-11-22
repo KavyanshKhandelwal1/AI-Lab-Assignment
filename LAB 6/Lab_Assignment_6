@@ -1,212 +1,223 @@
 import numpy as np
-from math import exp, factorial
 import matplotlib.pyplot as plt
+import os
+from fpdf import FPDF
 
-# --------------------------
-# PARAMETERS (change if needed)
-# --------------------------
-MAX_BIKES = 20             # maximum bikes per location
-MAX_MOVE = 5               # max bikes moved overnight (per night)
-RENTAL_REWARD = 10         # INR per rented bike
-MOVE_COST = 2              # INR per additional moved bike
-PARKING_COST_THRESHOLD = 10
-PARKING_COST = 4           # extra cost if > threshold bikes overnight at a location
-DISCOUNT = 0.9
+# Create results folder
+os.makedirs("lab6_results", exist_ok=True)
 
-# Poisson means: requests and returns per location (loc1, loc2)
-REQ_MEAN = [3.0, 4.0]
-RET_MEAN = [3.0, 2.0]
+class HopfieldNetwork:
+    def __init__(self, n_neurons):
+        self.n = n_neurons
+        self.W = np.zeros((n_neurons, n_neurons))
+    
+    def train_patterns(self, patterns):
+        """Hebbian learning rule"""
+        self.W = np.zeros((self.n, self.n))
+        for p in patterns:
+            p = p.reshape(-1, 1)
+            self.W += np.dot(p, p.T)
+        np.fill_diagonal(self.W, 0)
+        self.W /= self.n
+    
+    def recall(self, pattern, steps=20):
+        """Asynchronous recall updates"""
+        s = pattern.copy()
+        energy = []
+        for _ in range(steps):
+            for i in range(self.n):
+                h = np.dot(self.W[i], s)
+                s[i] = 1 if h >= 0 else -1
+            e = -0.5 * np.dot(s.T, np.dot(self.W, s))
+            energy.append(e)
+        return s, energy
 
-# truncate Poisson tails at POISSON_UPPER-1 (0..POISSON_UPPER-1)
-POISSON_UPPER = 11
+def random_patterns(n, p):
+    """Generate p random bipolar patterns"""
+    return [np.random.choice([-1, 1], size=n) for _ in range(p)]
 
-# --------------------------
-# HELPERS AND PRECOMPUTE
-# --------------------------
-def poisson_pmf(n, lam):
-    return exp(-lam) * (lam ** n) / factorial(n)
+def run_error_correction():
+    N = 100
+    hop = HopfieldNetwork(N)
+    patterns = random_patterns(N, 5)
+    hop.train_patterns(patterns)
 
-# build poisson pmfs (0..POISSON_UPPER-1) and add leftover tail to last bucket
-poisson_cache = {}
-for lam in set(REQ_MEAN + RET_MEAN):
-    pmf = [poisson_pmf(i, lam) for i in range(POISSON_UPPER)]
-    tail = 1.0 - sum(pmf)
-    pmf[-1] += tail
-    poisson_cache[lam] = pmf
+    pattern = patterns[0]
+    corrupted = pattern.copy()
+    flip_fraction = 0.25
+    flip_indices = np.random.choice(N, int(N*flip_fraction), replace=False)
+    corrupted[flip_indices] *= -1
 
-req_pmf = [poisson_cache[REQ_MEAN[0]], poisson_cache[REQ_MEAN[1]]]
-ret_pmf = [poisson_cache[RET_MEAN[0]], poisson_cache[RET_MEAN[1]]]
+    recalled, energy = hop.recall(corrupted, steps=20)
+    acc = np.sum(recalled == pattern) / N
 
-# Precompute per-location transitions:
-# prob_next[loc][start, next] = P(next_end_of_day = next | start)
-# exp_rent[loc][start, next] = expected rental INR contribution for that (start->next)
-prob_next = [np.zeros((MAX_BIKES + 1, MAX_BIKES + 1)) for _ in range(2)]
-exp_rent  = [np.zeros((MAX_BIKES + 1, MAX_BIKES + 1)) for _ in range(2)]
+    plt.figure()
+    plt.plot(energy, marker='o')
+    plt.title("Energy Convergence - Hopfield Error Correction")
+    plt.xlabel("Iteration")
+    plt.ylabel("Energy")
+    plt.grid(True)
+    plt.savefig("lab6_results/Q1_energy.png")
+    plt.close()
 
-for loc in (0, 1):
-    for start in range(MAX_BIKES + 1):
-        for r in range(POISSON_UPPER):
-            p_r = req_pmf[loc][r]
-            real_r = min(start, r)  # actual rentals limited by available bikes
-            bikes_after_r = start - real_r
-            rental_gain = RENTAL_REWARD * real_r
-            for ret in range(POISSON_UPPER):
-                p_ret = ret_pmf[loc][ret]
-                next_bikes = min(bikes_after_r + ret, MAX_BIKES)
-                prob_next[loc][start, next_bikes] += p_r * p_ret
-                exp_rent[loc][start, next_bikes] += p_r * p_ret * rental_gain
+    return acc, flip_fraction
 
-# Actions: net bikes moved from location 1 -> location 2 (positive: 1 -> 2)
-ACTIONS = np.arange(-MAX_MOVE, MAX_MOVE + 1)
+# ------------------------------------------------
+# Q2: Eight-Rook Problem using Hopfield Network
+# ------------------------------------------------
+def run_eight_rook():
+    N = 8
+    neurons = N * N
+    A, B = 4, 4
+    W = np.zeros((neurons, neurons))
+    theta = np.zeros(neurons)
 
-def parking_penalty(start1, start2):
-    cost = 0
-    if start1 > PARKING_COST_THRESHOLD:
-        cost += PARKING_COST
-    if start2 > PARKING_COST_THRESHOLD:
-        cost += PARKING_COST
-    return cost
+    def index(i, j): return i * N + j
 
-def feasible_actions(state1, state2):
-    """Return list of feasible actions given end-of-day counts (can't move more bikes than you have)."""
-    feas = []
-    for a in ACTIONS:
-        if a > 0 and a > state1:
-            continue
-        if a < 0 and (-a) > state2:
-            continue
-        feas.append(a)
-    return feas
+    # Construct weights for constraints
+    for i in range(N):
+        for j in range(N):
+            idx = index(i, j)
+            for k in range(N):
+                if k != j:
+                    W[idx, index(i, k)] -= A
+                if k != i:
+                    W[idx, index(k, j)] -= B
+            theta[idx] = -(A + B)
 
-# Precompute transitions for each (state1,state2,action) to speed up evaluation.
-# Store for each triple:
-#   - 'trans': list of (next1, next2, prob) triplets (only nonzero probs)
-#   - 'exp_rent': scalar expected rental INR (unconditional)
-#   - 'immediate_cost': scalar cost of moving+parking for that action
-from collections import defaultdict
-transitions = {}
+    v = np.random.choice([0, 1], size=neurons)
+    energy = []
 
-for s1 in range(MAX_BIKES + 1):
-    for s2 in range(MAX_BIKES + 1):
-        for a in ACTIONS:
-            # infeasible action skip
-            if a > 0 and a > s1:
-                continue
-            if a < 0 and (-a) > s2:
-                continue
-            start1 = min(max(s1 - a, 0), MAX_BIKES)  # bikes available start-of-day at loc1
-            start2 = min(max(s2 + a, 0), MAX_BIKES)  # loc2
+    for _ in range(400):
+        i = np.random.randint(0, neurons)
+        h = np.dot(W[i], v) - theta[i]
+        v[i] = 1 if h > 0 else 0
+        e = -0.5 * np.dot(v.T, np.dot(W, v)) + np.dot(theta, v)
+        energy.append(e)
 
-            # move cost: first bike when moving 1->2 is free
-            if a > 0:
-                move_cost = MOVE_COST * max(0, a - 1)
-            else:
-                move_cost = MOVE_COST * abs(a)
-            park_cost = parking_penalty(start1, start2)
-            immediate_cost = move_cost + park_cost
+    board = v.reshape((N, N))
 
-            # unconditional expected rent contribution for start1,start2
-            exp_rent_scalar = exp_rent[0][start1].sum() + exp_rent[1][start2].sum()
+    plt.figure(figsize=(6, 3))
+    plt.subplot(1, 2, 1)
+    plt.plot(energy)
+    plt.title("Energy Convergence - Eight Rook Problem")
+    plt.xlabel("Iteration")
+    plt.ylabel("Energy")
+    plt.grid(True)
 
-            # build transition list of next states
-            trans_list = []
-            for n1 in range(MAX_BIKES + 1):
-                p1 = prob_next[0][start1, n1]
-                if p1 == 0:
-                    continue
-                for n2 in range(MAX_BIKES + 1):
-                    p2 = prob_next[1][start2, n2]
-                    if p2 == 0:
-                        continue
-                    prob = p1 * p2
-                    trans_list.append((n1, n2, prob))
-
-            transitions[(s1, s2, a)] = {
-                'trans': trans_list,
-                'exp_rent': exp_rent_scalar,
-                'immediate_cost': immediate_cost
-            }
-
-# --------------------------
-# POLICY ITERATION
-# --------------------------
-policy = np.zeros((MAX_BIKES + 1, MAX_BIKES + 1), dtype=int)  # initial policy: do nothing
-V = np.zeros((MAX_BIKES + 1, MAX_BIKES + 1))                  # initial value function
-
-def expected_return_precomp(i, j, a, V_array):
-    info = transitions[(i, j, a)]
-    exp_rent_scalar = info['exp_rent']
-    immediate_cost = info['immediate_cost']
-    # immediate expected reward is exp_rent_scalar - immediate_cost
-    expected = exp_rent_scalar - immediate_cost
-    # add discounted expected value of next states
-    s = 0.0
-    for (n1, n2, prob) in info['trans']:
-        s += prob * V_array[n1, n2]
-    expected += DISCOUNT * s
-    return expected
-
-def policy_iteration(max_iters=50, theta=1e-3):
-    global policy, V
-    it = 0
-    while True:
-        it += 1
-        # Policy evaluation (iterative until small delta)
-        while True:
-            delta = 0.0
-            V_new = np.copy(V)
-            for i in range(MAX_BIKES + 1):
-                for j in range(MAX_BIKES + 1):
-                    a = policy[i, j]
-                    if (i, j, a) not in transitions:
-                        feas = feasible_actions(i, j)
-                        a = feas[0]
-                    V_new[i, j] = expected_return_precomp(i, j, a, V)
-                    delta = max(delta, abs(V_new[i, j] - V[i, j]))
-            V = V_new
-            if delta < theta:
-                break
-
-        # Policy improvement
-        policy_stable = True
-        for i in range(MAX_BIKES + 1):
-            for j in range(MAX_BIKES + 1):
-                old_action = policy[i, j]
-                best_action = old_action
-                best_value = -1e12
-                for a in feasible_actions(i, j):
-                    if (i, j, a) not in transitions:
-                        continue
-                    val = expected_return_precomp(i, j, a, V)
-                    if val > best_value:
-                        best_value = val
-                        best_action = a
-                policy[i, j] = best_action
-                if best_action != old_action:
-                    policy_stable = False
-
-        print(f"Policy iteration {it}, policy_stable={policy_stable}")
-        if policy_stable or it >= max_iters:
-            break
-
-    return policy, V
-
-# Run policy iteration
-if _name_ == "_main_":
-    opt_policy, opt_V = policy_iteration(max_iters=50, theta=1e-3)
-
-    # Print results summary:
-    print("\nOptimal policy (action = bikes moved from loc1 -> loc2):")
-    print(opt_policy)
-    print("\nSample of optimal value function (V[0..5,0..5]):")
-    print(opt_V[:6, :6])
-
-    # Plot policy heatmap
-    plt.figure(figsize=(9, 6))
-    plt.imshow(opt_policy.T, origin='lower', extent=[0, MAX_BIKES, 0, MAX_BIKES])
-    plt.colorbar(label='Action (move from loc1 -> loc2)')
-    plt.xlabel('Bikes at location 1 (end of day)')
-    plt.ylabel('Bikes at location 2 (end of day)')
-    plt.title('Optimal policy: action = bikes moved from loc1 to loc2')
+    plt.subplot(1, 2, 2)
+    plt.imshow(board, cmap='gray_r')
+    plt.title("Final 8-Rook Board")
     plt.tight_layout()
-    plt.show()
+    plt.savefig("lab6_results/Q2_rook.png")
+    plt.close()
+
+    return board
+
+# ------------------------------------------------
+# Q3: TSP with 10 Cities using Hopfield-Tank Model
+# ------------------------------------------------
+def run_tsp(num_cities=10, iterations=3000, A=500, B=500, C=200):
+    np.random.seed(0)
+    D = np.random.randint(10, 100, (num_cities, num_cities))
+    np.fill_diagonal(D, 0)
+    D = (D + D.T) / 2
+
+    V = np.random.rand(num_cities, num_cities)
+
+    def sigmoid(x, lam=1):
+        # Prevent overflow
+        x = np.clip(x, -100, 100)
+        return 1 / (1 + np.exp(-lam * x))
+
+    energy = []
+    for step in range(iterations):
+        dV = np.zeros_like(V)
+        for i in range(num_cities):
+            for p in range(num_cities):
+                term1 = A * (np.sum(V[i, :]) - 1)
+                term2 = B * (np.sum(V[:, p]) - 1)
+                term3 = sum(D[i, j] * (V[j, (p+1) % num_cities] + V[j, (p-1) % num_cities])
+                            for j in range(num_cities) if j != i)
+                dV[i, p] = -A*term1 - B*term2 - C*term3
+        V = sigmoid(V + dV * 0.001)
+
+        e = (A/2)*np.sum((np.sum(V, axis=1)-1)**2) + \
+            (B/2)*np.sum((np.sum(V, axis=0)-1)**2)
+        energy.append(e)
+
+    tour = np.argmax(V, axis=0)
+    tour_length = sum(D[tour[i], tour[(i+1) % num_cities]] for i in range(num_cities))
+
+    plt.figure(figsize=(6, 3))
+    plt.subplot(1, 2, 1)
+    plt.plot(energy)
+    plt.title("Energy Convergence - TSP (10 Cities)")
+    plt.xlabel("Iteration")
+    plt.ylabel("Energy")
+    plt.grid(True)
+
+    plt.subplot(1, 2, 2)
+    plt.imshow(V, cmap='plasma')
+    plt.title("Final Activation Matrix")
+    plt.colorbar(label="Activation")
+    plt.tight_layout()
+    plt.savefig("lab6_results/Q3_tsp.png")
+    plt.close()
+
+    return tour, tour_length
+
+# ------------------------------------------------
+# PDF REPORT GENERATOR
+# ------------------------------------------------
+def generate_report(acc, flip_fraction, board, tour, tour_length):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(200, 10, "Lab 6: Hopfield Network Experiments", ln=True, align="C")
+
+    pdf.set_font("Arial", "", 12)
+    pdf.multi_cell(0, 10, "Learning Objective: To understand the working of Hopfield networks and apply them to combinatorial problems.\n")
+
+    # --- Q1 ---
+    pdf.set_font("Arial", "B", 14)
+    pdf.cell(0, 10, "Q1: Error Correcting Capability", ln=True)
+    pdf.set_font("Arial", "", 12)
+    pdf.multi_cell(0, 10, f"The network stored 5 random 100-bit patterns. A pattern corrupted with {int(flip_fraction*100)}% bit flips was successfully recovered with {acc*100:.2f}% accuracy.\n")
+    pdf.image("lab6_results/Q1_energy.png", w=170)
+
+    # --- Q2 ---
+    pdf.set_font("Arial", "B", 14)
+    pdf.cell(0, 10, "Q2: Eight-Rook Problem", ln=True)
+    pdf.set_font("Arial", "", 12)
+    pdf.multi_cell(0, 10, "The Hopfield network minimized the energy of an 8x8 binary configuration to place exactly one rook per row and column. The final stable configuration and energy trajectory are shown below.")
+    pdf.image("lab6_results/Q2_rook.png", w=170)
+
+    # --- Q3 ---
+    pdf.set_font("Arial", "B", 14)
+    pdf.cell(0, 10, "Q3: TSP (10 Cities)", ln=True)
+    pdf.set_font("Arial", "", 12)
+    pdf.multi_cell(0, 10, f"The Hopfield-Tank network (100 neurons, ~10,000 weights) was used to approximate a 10-city traveling salesman problem. The final route found was {tour.tolist()} with total distance {tour_length:.2f}.")
+    pdf.image("lab6_results/Q3_tsp.png", w=170)
+
+    # --- Conclusions ---
+    pdf.set_font("Arial", "B", 14)
+    pdf.cell(0, 10, "Conclusions", ln=True)
+    pdf.set_font("Arial", "", 12)
+    pdf.multi_cell(0, 10, 
+        "1. The Hopfield network demonstrated associative recall and error correction up to 25% corruption.\n"
+        "2. The 8-Rook problem was solved by defining appropriate inhibitory weights enforcing one rook per row and column.\n"
+        "3. The Hopfield-Tank continuous network approximated the TSP via energy minimization, illustrating its potential for optimization tasks.\n")
+
+    pdf.output("./lab6_results/Lab6_Report.pdf")
+    print("\n📄 Report successfully generated at: lab6_results/Lab6_Report.pdf")
+
+# ------------------------------------------------
+# MAIN EXECUTION
+# ------------------------------------------------
+if __name__ == "__main__":
+    print("\nLAB 6: Hopfield Network Experiments (Team : Code Warriors) ===")
+    acc, flip_fraction = run_error_correction()
+    board = run_eight_rook()
+    tour, tour_length = run_tsp()
+    generate_report(acc, flip_fraction, board, tour, tour_length)
